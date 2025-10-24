@@ -1,6 +1,9 @@
 import openai
 import json
-from typing import Dict, List, Dict, Any
+from typing import List, Dict, Any
+
+from dotenv import load_dotenv
+from openai import OpenAI
 
 
 def _sanitize_and_generate_content(facts: List[Dict], category: str) -> List[Dict]:
@@ -18,7 +21,8 @@ def _sanitize_and_generate_content(facts: List[Dict], category: str) -> List[Dic
             print(f"     🛠️ Generando 'content_para_busqueda' faltante para un hecho de '{category}'.")
             summary_parts = []
             if category == "ubicaciones":
-                summary_parts.append(f"La sede se encuentra en {fact.get('direccion_completa', 'dirección no especificada')}")
+                summary_parts.append(
+                    f"La sede se encuentra en {fact.get('direccion_completa', 'dirección no especificada')}")
                 if fact.get('distrito'):
                     summary_parts.append(f"en el distrito de {fact.get('distrito')}.")
             elif category == "precios":
@@ -26,11 +30,16 @@ def _sanitize_and_generate_content(facts: List[Dict], category: str) -> List[Dic
                 if fact.get('valor') is not None:
                     summary_parts.append(f"por {fact.get('valor')} {fact.get('moneda', '')}.")
             elif category == "horarios":
-                 summary_parts.append(f"La clase '{fact.get('nombre_clase', 'no especificada')}' es impartida por {fact.get('instructor', 'instructor no especificado')}")
-                 if fact.get('dia_semana'):
-                    summary_parts.append(f"el día {fact.get('dia_semana')} de {fact.get('hora_inicio', '')} a {fact.get('hora_fin', '')}.")
-            else: # Fallback genérico
-                summary_parts.append(f"Dato de tipo '{category}': " + ", ".join([f"{k}: {v}" for k, v in fact.items() if k != 'content_para_busqueda' and v]))
+                summary_parts.append(
+                    f"La clase '{fact.get('nombre_clase', 'no especificada')}' es impartida por {fact.get('instructor', 'instructor no especificado')}")
+                if fact.get('dia_semana'):
+                    summary_parts.append(
+                        f" el día {fact.get('dia_semana')} de {fact.get('hora_inicio', '')} a {fact.get('hora_fin', '')}.")
+                if fact.get('fecha'):
+                    summary_parts.append(f" en la fecha {fact.get('fecha')}.")
+            else:  # Fallback genérico
+                summary_parts.append(f"Dato de tipo '{category}': " + ", ".join(
+                    [f"{k}: {v}" for k, v in fact.items() if k != 'content_para_busqueda' and v]))
 
             fact["content_para_busqueda"] = " ".join(summary_parts).strip()
 
@@ -43,11 +52,22 @@ def extract_structured_data(
         page_url: str,
         url_type: str,
         html_content: str,
-        gym_name: str
+        gym_name: str,
+        tables: list[str] = None
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Uses an OpenAI model to parse HTML and extract a list of structured "fact documents".
     """
+    # Using .format() requires escaping the JSON braces with {{ and }}
+    # But for the placeholder {html_content}, we use single braces.
+    # The prompt is already formatted this way.
+    # Si hay tablas, las agregamos en formato legible
+    tables_section = ""
+    if tables:
+        tables_section = "\n\n---\n### Tablas detectadas (para usar como apoyo)\n"
+        for i, tbl in enumerate(tables, start=1):
+            tables_section += f"\n**Tabla {i}:**\n```\n{tbl}\n```\n"
+
     prompt_template = """
 ``` text
 Eres un agente de extracción de datos de clase mundial para la industria del fitness, especializado en convertir contenido web en registros estructurados para una base de datos PostgreSQL que utiliza pgvector.
@@ -55,22 +75,82 @@ Eres un agente de extracción de datos de clase mundial para la industria del fi
 **Tu Objetivo:**
 Analizar el contenido HTML de la página de un gimnasio y extraer rigurosamente toda la información sobre **ubicaciones, precios, horarios y disciplinas**.
 
-**Tus Instrucciones Clave:**
-1.  **Idioma de Salida:** Todo el texto extraído DEBE estar en **español**.
-2.  **Estructura de Salida:** Debes devolver un único objeto JSON con claves de nivel superior que se mapean a tablas: `"ubicaciones"`, `"precios"`, `"horarios"`, `"disciplinas"`.
-3.  **Requisito Híbrido (¡MUY IMPORTANTE!):** Para CADA objeto individual que extraigas, DEBES generar dos cosas:
-    a) Un campo `"content_para_busqueda"`: Una única oración concisa y en lenguaje natural que resuma la información del objeto. Este campo es esencial para la búsqueda por vectores.
-    b) Los campos de datos estructurados (`snake_case`) que se mapearán a las columnas de la base de datos.
-4.  **Búsqueda Oportunista:** La `url_type` es una pista, pero DEBES escanear todo el HTML en busca de CUALQUIER tipo de dato relevante en cada página.
-5.  **Caso Vacío:** Si no encuentras información para una categoría, devuelve una lista vacía `[]` para esa clave.
+---
 
-**Definición de Esquemas (Schemas):**
-*   **Para `"ubicaciones"`:** `{{"content_para_busqueda": str, "direccion_completa": str, "distrito": str}}`
-*   **Para `"precios"`:** `{{"content_para_busqueda": str, "descripcion_plan": str, "valor": float, "moneda": str, "recurrencia": str}}`
-*   **Para `"horarios"`:** `{{"content_para_busqueda": str, "sede": str, "nombre_clase": str, "instructor": str, "dia_semana": str, "hora_inicio": str, "hora_fin": str}}`
-*   **Para `"disciplinas"`:** `{{"content_para_busqueda": str, "nombre": str, "descripcion_corta": str}}`
+### ⚙️ Instrucciones Clave
+
+1. **Idioma de salida:** Todo el texto extraído DEBE estar en **español**.
+2. **Formato de salida:** Devuelve un único objeto JSON con las claves de nivel superior:
+   - `"ubicaciones"`
+   - `"precios"`
+   - `"horarios"`
+   - `"disciplinas"`
+
+3. **Campo obligatorio de búsqueda:**  
+   Cada objeto individual DEBE incluir:
+   - `"content_para_busqueda"` → Una oración breve y natural que resuma su contenido para indexación vectorial.
+   - Los campos estructurados específicos definidos en los esquemas más abajo.
+
+4. **Regla de separación estricta (MUY IMPORTANTE):**
+   - **Cada sede, dirección o distrito diferente DEBE ser un objeto separado dentro de `"ubicaciones"`.**
+   - **Nunca combines varias direcciones o distritos en un solo registro.**
+   - Si se mencionan varias ubicaciones en una misma frase (por ejemplo, *“Sede Chacarilla y Sede Miraflores”*), genera **un objeto por cada sede**.
+
+5. **Precios por sede:**
+    - **Algunos gimnasios pueden tener precios diferentes por sede. Indicar claramente en el campo `sede` la tarifa extraída.
+     Si no es el caso, colocar 'Todas' como sede.**
+
+6. **Búsqueda oportunista:**  
+   Aunque `url_type` sirve como pista, debes escanear TODO el HTML en busca de datos relevantes para cada categoría.
+
+7. **Caso vacío:**  
+   Si no se encuentra información válida para alguna categoría, devuelve `[]` en esa clave.
 
 ---
+
+### 🧩 Esquemas Esperados
+
+* **Para `"ubicaciones"`:**  
+  `{{"content_para_busqueda": str, "direccion_completa": str, "distrito": str}}`
+
+* **Para `"precios"`:**  
+  `{{"content_para_busqueda": str, "sede": str, "descripcion_plan": str, "valor": float, "moneda": str, "recurrencia": str}}`
+
+* **Para `"horarios"`:**  
+  `{{"content_para_busqueda": str, "sede": str, "nombre_clase": str, "instructor": str, "fecha": str, "dia_semana": str, "hora_inicio": str, "hora_fin": str}}`
+
+* **Para `"disciplinas"`:**  
+  `{{"content_para_busqueda": str, "nombre": str, "descripcion_corta": str}}`
+
+---
+
+### ⚡ Ejemplo de corrección de agrupamiento
+**Entrada HTML:**
+```html
+<p>Nuestras sedes: Chacarilla en Av Primavera 264, Surco. Miraflores en Calle Ayacucho 153, Miraflores.</p>
+```json
+{{
+  "ubicaciones": [
+    {{
+      "content_para_busqueda": "La sede Chacarilla se encuentra en Av Primavera 264, Surco.",
+      "direccion_completa": "Av Primavera 264, Surco",
+      "distrito": "Surco"
+    }},
+    {{
+      "content_para_busqueda": "La sede Miraflores se encuentra en Calle Ayacucho 153, Miraflores.",
+      "direccion_completa": "Calle Ayacucho 153, Miraflores",
+      "distrito": "Miraflores"
+    }}
+  ],
+  "precios": [],
+  "horarios": [],
+  "disciplinas": []
+}}
+```
+
+**Entrada HTML:**
+```html
+<p>Nuestras sedes: Chacarilla en Av Primavera 264, Surco. Miraflores en Calle Ayacucho 153, Miraflores.</p>
 **Ejemplo 1: Contenido Mixto en una URL de 'ubicaciones'**
 
 **page_url:** "https://gym.com/sedes/miraflores"
@@ -124,25 +204,24 @@ json {{ "ubicaciones": [], "precios": [], "horarios": [], "disciplinas": [] }}``
 
 **Tarea:** Analiza las siguientes entradas y genera el objeto JSON estructurado.
 
+**gym_name:** "{gym_name}"
 **page_url:** "{page_url}"
 **url_type:** "{url_type}"
 **html_content:** '''
 {html_content}
+{tables_section}
 '''
 
 **Tu Salida:**
 ```
 
 """
-    # Using .format() requires escaping the JSON braces with {{ and }}
-    # But for the placeholder {html_content}, we use single braces.
-    # The prompt is already formatted this way.
-
     full_prompt = prompt_template.format(
         gym_name=gym_name,
         page_url=page_url,
         url_type=url_type,
-        html_content=html_content
+        html_content=html_content,
+        tables_section=tables_section
     )
 
     try:
@@ -181,10 +260,6 @@ json {{ "ubicaciones": [], "precios": [], "horarios": [], "disciplinas": [] }}``
     except Exception as e:
         print(f"     ❌ An error occurred calling OpenAI: {e}")
         return {"ubicaciones": [], "precios": [], "horarios": [], "disciplinas": []}
-
-    except Exception as e:
-        print(f"     ❌ An error occurred calling OpenAI: {e}")
-        return []
 
 
 def categorize_urls_with_llm(urls: List[str], client: openai.OpenAI) -> Dict[str, List[str]]:
@@ -275,3 +350,158 @@ Analyze the URL path carefully. Prioritize Spanish keywords such as 'sedes', 'pr
     except Exception as e:
         print(f"❌ An error occurred while calling OpenAI: {e}")
         return {"locations": [], "pricing": [], "schedules": [], "disciplines": []}
+
+
+def merge_gym_data_with_llm(gym_name: str, url_to_json_map: dict[str, dict | str], client: openai.OpenAI) -> dict:
+    """
+    Usa un LLM para combinar múltiples outputs JSON (uno por URL)
+    en un único JSON con las claves 'ubicaciones', 'precios', 'horarios' y 'disciplinas'.
+    """
+
+    serialized_sections = []
+    for url, content in url_to_json_map.items():
+        if isinstance(content, dict):
+            content_str = json.dumps(content, ensure_ascii=False, indent=2)
+        else:
+            content_str = content.strip()
+        serialized_sections.append(f"📄 **URL:** {url}\n```json\n{content_str}\n```")
+
+    joined_inputs = "\n\n---\n\n".join(serialized_sections)
+
+    prompt = f"""
+Eres un experto en integración y limpieza de datos para gimnasios y centros fitness.
+
+Tu tarea es combinar y deduplicar información estructurada extraída desde **múltiples páginas del gimnasio "{gym_name}"**.
+
+Cada página contiene datos parciales en formato JSON, con las claves:
+`"ubicaciones"`, `"precios"`, `"horarios"`, `"disciplinas"`.
+
+---
+
+### 🧩 Tu objetivo
+Fusiona todas las entradas de distintas URLs en **un solo objeto JSON unificado**, asegurando:
+
+1. **Integridad:** No pierdas información relevante de ningún fragmento.
+2. **Consistencia:** Unifica formato, tipos de datos y nombres de sedes.
+3. **Deduplicación:** Si varias URLs repiten la misma sede o dirección, mantenla solo una vez.
+4. **Vinculación:** Asegura que cada precio y horario tenga un campo `"sede"` coherente.
+5. **Idioma:** Devuelve todos los textos en español natural.
+6. **Trazabilidad:** No incluyas las URLs en la salida final.
+7. **Localidad**: IMPORTANTE. combinar ubicaciones con descripciones similares en un solo registro. La dirección debe ser 
+lo más precisa posible (calle, número, distrito, ciudad). Asumir que no es probable que haya dos sedes en un mismo distrito o direcciones muy cercanas.
+
+---
+
+### ⚙️ Estructura esperada:
+
+```json
+{{
+  "gym": "{gym_name}",
+  "ubicaciones": [
+    {{
+      "content_para_busqueda": str,
+      "direccion_completa": str,
+      "distrito": str
+    }}
+  ],
+  "precios": [
+    {{
+      "content_para_busqueda": str,
+      "sede": str,
+      "descripcion_plan": str,
+      "valor": float,
+      "moneda": str,
+      "recurrencia": str
+    }}
+  ],
+  "horarios": [
+    {{
+      "content_para_busqueda": str,
+      "sede": str,
+      "nombre_clase": str,
+      "instructor": str,
+      "fecha": str,
+      "dia_semana": str,
+      "hora_inicio": str,
+      "hora_fin": str
+    }}
+  ],
+  "disciplinas": [
+    {{
+      "content_para_busqueda": str,
+      "nombre": str,
+      "descripcion_corta": str
+    }}
+  ]
+}}
+```  
+    📦 Datos de entrada:
+
+    {joined_inputs}
+
+    ⚡ Tu salida:
+
+    Devuelve solo el JSON final. No incluyas explicaciones ni comentarios.
+    🚫 Importante: No devuelvas el JSON dentro de bloques de código ni uses comillas triples. Solo devuelve el objeto JSON plano.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Eres un asistente experto en fusión y deduplicación de datos JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=5000,
+    )
+
+    text_output = response.choices[0].message.content.strip()
+
+    try:
+        return json.loads(text_output)
+    except json.JSONDecodeError:
+        print("⚠️ El modelo devolvió texto no válido. Retornando texto crudo.")
+        return {"raw_output": text_output}
+
+
+if __name__ == "__main__":
+    url_to_json = {
+        "https://gym.com/sedes/miraflores": {
+            "ubicaciones": [
+                {
+                    "direccion_completa": "Av. Larco 123, Miraflores, Lima",
+                    "distrito": "Miraflores",
+                    "content_para_busqueda": "Sede Miraflores..."
+                }
+            ],
+            "precios": [],
+            "horarios": [],
+            "disciplinas": []
+        },
+        "https://gym.com/sedes/surco": {
+            "ubicaciones": [
+                {
+                    "direccion_completa": "Av. Primavera 264, Surco",
+                    "distrito": "Surco",
+                    "content_para_busqueda": "Sede Surco..."
+                }
+            ],
+            "precios": [
+                {
+                    "sede": "Surco",
+                    "descripcion_plan": "Plan mensual",
+                    "valor": 250,
+                    "moneda": "PEN",
+                    "recurrencia": "mensual",
+                    "content_para_busqueda": "Plan mensual en sede Surco por S/250."
+                }
+            ],
+            "horarios": [],
+            "disciplinas": []
+        }
+    }
+    load_dotenv()
+    client = OpenAI()
+    merged = merge_gym_data_with_llm("Nasce Yoga", url_to_json, client)
+    print(json.dumps(merged, indent=2, ensure_ascii=False))

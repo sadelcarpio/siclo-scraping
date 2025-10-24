@@ -1,16 +1,12 @@
-import html
 import re
-import time
-from urllib.parse import urljoin
 
 import openai
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, Page
-from pydantic.v1.schema import field_class_to_schema
 from selectolax.parser import HTMLParser
 
 from sitemap_utils import get_filtered_sitemap_urls
-from src.llm import categorize_urls_with_llm, extract_structured_data
+from src.llm import categorize_urls_with_llm, extract_structured_data, merge_gym_data_with_llm
 
 pages_to_scrape = {
     # "bioritmo": "https://www.bioritmo.com.pe/",
@@ -35,7 +31,7 @@ pages_to_scrape = {
 
 
 def should_skip_frame(frame):
-    skip_domains = ["stripe.com", "facebook.com", "google.com", "analytics"]
+    skip_domains = ["stripe.com", "facebook.com", "google.com", "analytics", "wixapps"]
     return any(domain in frame.url for domain in skip_domains)
 
 
@@ -65,57 +61,96 @@ def scroll_until_iframes(page: Page, max_scrolls: int = 30, scroll_step: int = 1
         page.wait_for_timeout(1000)
     return last_count
 
-def prune_html_for_llm(html_content: str, keywords: list[str] = None) -> str:
+
+def flatten_nested_divs_regex(html: str) -> str:
     """
-    Prunes HTML content to only the most relevant sections for an LLM.
-    This significantly reduces token count and improves accuracy.
+    Colapsa wrappers <div><div>...</div></div> hasta dejar solo <div>...</div>.
+    Funciona de forma iterativa y es segura para fragments.
+    """
+    if not html:
+        return html
+
+    prev = None
+    out = html
+
+    # Paso 1: normalizar un poco espacios entre etiquetas
+    out = re.sub(r'>\s+<', '><', out)
+
+    # Iteramos hasta convergencia
+    while prev != out:
+        prev = out
+        # 1) Colapsar aperturas: <div ...><div ...> -> <div>
+        out = re.sub(r'<div\b[^>]*>\s*<div\b[^>]*>', '<div>', out, flags=re.IGNORECASE)
+
+        # 2) Colapsar cierres: </div></div> -> </div>
+        out = re.sub(r'</div>\s*</div>', '</div>', out, flags=re.IGNORECASE)
+
+    # Opcional: limpiar repetidos de espacios y newlines
+    out = re.sub(r'\s+', ' ', out).strip()
+
+    return out
+
+
+def prune_html_for_llm(html_content: str, keywords: list[str] = None) -> tuple[str, list[str]]:
+    """
+    Limpia HTML y extrae contenido relevante y tablas legibles para un LLM.
+    Devuelve (html_limpio, tablas_en_texto)
     """
     tree = HTMLParser(html_content)
 
-    # Step 1: Isolate the main content container
+    # 1️⃣ Intentar aislar contenedor principal
     main_container = None
-
-    # Try finding the <main> tag first
     if tree.body:
         main_container = tree.body.css_first('main')
-
-    # If no <main>, try finding a div/section with role="main"
     if not main_container and tree.body:
         main_container = tree.body.css_first('[role="main"]')
 
-    # Fallback: if keywords are provided, find the best container holding them
+    # fallback: buscar div o section con palabras clave
     if not main_container and keywords and tree.body:
-        best_candidate = None
-        max_score = 0
+        best_candidate, max_score = None, 0
         for node in tree.body.css('div, section'):
             score = sum(node.text(deep=True).lower().count(kw) for kw in keywords)
             if score > max_score:
-                max_score = score
-                best_candidate = node
+                max_score, best_candidate = score, node
         if max_score > 0:
             main_container = best_candidate
 
-    # If we found a specific container, use it. Otherwise, use the whole body.
     root_node = main_container if main_container else tree.body
-
     if not root_node:
-        return ""  # Return empty string if no body or content found
+        return "", []
 
-    # Step 2: Remove noise tags from the chosen container
+    # 2️⃣ Remover ruido visual / irrelevante
     noise_tags = ['script', 'style', 'svg', 'nav', 'footer', 'header']
     for tag in noise_tags:
         for node in root_node.css(tag):
-            node.decompose()  # decompose() removes the node and its children
-    # 2. Obtener HTML limpio.
-    html_sin_ruido = root_node.html
+            node.decompose()
 
-    # 4. Reemplazar múltiples saltos de línea por uno solo.
-    html_sin_lineas = re.sub(r'\n+', '\n', html_sin_ruido)
+    # 3️⃣ Extraer tablas como texto legible
+    table_texts = []
+    for table in root_node.css('table'):
+        rows = []
+        for tr in table.css('tr'):
+            cells = [td.text(strip=True) for td in tr.css('th, td')]
+            if any(cells):
+                rows.append(" | ".join(cells))
+        if rows:
+            table_texts.append("\n".join(rows))
+        table.decompose()  # eliminar tabla del HTML principal (para no duplicar)
 
-    # 5. Reemplazar múltiples espacios (incluyendo tabs y line breaks) por uno solo.
-    html_comprimido = re.sub(r'\s+', ' ', html_sin_lineas)
+    # 4️⃣ Eliminar todos los atributos de los nodos
+    for node in root_node.css("*"):
+        if node.attributes:
+            node.attributes.clear()
 
-    return html_comprimido.strip()
+    # 5️⃣ Obtener HTML limpio
+    html_clean = root_node.html
+
+    # 6️⃣ Compactar espacios y saltos de línea
+    html_clean = re.sub(r'\n+', '\n', html_clean)
+    html_clean = re.sub(r'\s+', ' ', html_clean)
+    html_clean = html_clean.strip()
+
+    return html_clean, table_texts
 
 
 
@@ -153,14 +188,6 @@ def scrape_single_url(client: openai.OpenAI, page: Page, url: str, url_type: str
     """
     print(f"  -> Scraping URL principal: {url}")
 
-    # Acumulador para todos los datos encontrados en esta URL y sus iframes.
-    datos_acumulados = {
-        "ubicaciones": {},
-        "precios": {},
-        "horarios": {},
-        "disciplinas": {}
-    }
-
     chunks_data = {}
 
     try:
@@ -174,31 +201,25 @@ def scrape_single_url(client: openai.OpenAI, page: Page, url: str, url_type: str
                 continue
             print(f"     Found relevant iframe. Scraping: {frame.url}")
             try:
-                page.goto(frame.url, wait_until="networkidle", timeout=45000)
+                try:
+                    page.goto(frame.url, wait_until="networkidle", timeout=45000)
+                except Exception:
+                    page.goto(frame.url, wait_until="domcontentloaded", timeout=45000)
                 frame_html = page.content()
-                pruned_frame_html = prune_html_for_llm(frame_html)
+                pruned_frame_html, tables = prune_html_for_llm(frame_html)
 
                 if pruned_frame_html.strip():
                     print(f"     Extracting from iframe content...")
                     iframe_data = extract_structured_data(client, frame.url, "iframe_content", pruned_frame_html,
-                                                          gym_name)
+                                                          gym_name, tables)
                     # Fusionar datos del iframe
                     if iframe_data:
                         chunks_data[frame.url] = iframe_data
-                        for category, items in iframe_data.items():
-                            for item in items:
-                                item_key = _get_item_key(item, category)
-                                if item_key:
-                                    if item_key not in datos_acumulados[category]:
-                                        datos_acumulados[category][item_key] = item
-                                    else:
-                                        existing = datos_acumulados[category][item_key]
-                                        datos_acumulados[category][item_key] = _merge_items(existing, item)
             except Exception as e:
                 print(f"     ❌ Failed to scrape iframe {frame.url}: {e}")
 
         # Convertir los diccionarios acumulados de nuevo a listas
-        return {category: list(items_dict.values()) for category, items_dict in datos_acumulados.items()}
+        return chunks_data
 
     except Exception as e:
         print(f"     ❌ Failed to scrape main URL {url}: {e}")
@@ -217,33 +238,19 @@ def main():
             filtered_urls = categorize_urls_with_llm(urls_to_scrape, client)
             filtered_urls["homepage"] = [site_url]
             print(filtered_urls)
-            datos_site = {
-                "ubicaciones": {},
-                "precios": {},
-                "horarios": {},
-                "disciplinas": {}
-            }
+            chunked_data = {}
             for page_type, sub_urls in filtered_urls.items():
-                if page_type != "homepage":
-                    continue
                 page = browser.new_page()
                 try:
                     for sub_url in sub_urls:
                         extracted_data = scrape_single_url(client, page, sub_url, page_type, gym_name)
-                        for category, items in extracted_data.items():
-                            for item in items:
-                                key = _get_item_key(item, category)
-                                if not key:
-                                    continue
-                                if key not in datos_site[category]:
-                                    datos_site[category][key] = item
-                                else:
-                                    datos_site[category][key] = _merge_items(datos_site[category][key], item)
+                        chunked_data = chunked_data | extracted_data
                 except Exception as e:
                     print(e)
                 finally:
                     page.close()
-            print(datos_site)
+            print(chunked_data)
+            merged_gym_data = merge_gym_data_with_llm(gym_name, chunked_data, client)
         browser.close()
     print("Scraping complete.")
 
