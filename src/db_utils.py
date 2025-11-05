@@ -65,12 +65,12 @@ def bulk_insert(conn, gym_name: str, merged_data: dict):
 
         # Horarios
         horarios_data = [
-            (gym_id, h.get("sede"), h.get("nombre_clase"), h.get("dia_semana"), h.get("hora_inicio"), h.get("hora_fin"))
+            (gym_id, h.get("sede"), h.get("nombre_clase"), h.get("fecha"), h.get("dia_semana"), h.get("hora_inicio"), h.get("hora_fin"))
             for h in merged_data.get("horarios", [])
         ]
         execute_batch(cur, """
-            INSERT INTO horarios (gym_id, sede, nombre_clase, dia_semana, hora_inicio, hora_fin)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO horarios (gym_id, sede, nombre_clase, fecha, dia_semana, hora_inicio, hora_fin)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING;
         """, horarios_data)
 
